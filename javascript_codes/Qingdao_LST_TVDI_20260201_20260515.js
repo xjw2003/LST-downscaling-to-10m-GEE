@@ -1,11 +1,13 @@
 /*
- * Google Earth Engine 中的青岛地表温度（LST）10 m 降尺度脚本
+ * Google Earth Engine 中的青岛地表温度（LST）10 m 降尺度与 TVDI 计算脚本
  *
  * 用途
  * -------
  * 以 Landsat 8/9 Collection 2 Level-2 地表温度作为粗分辨率基础 LST，
  * 使用 Landsat 光谱波段和指数建立回归模型，再把该模型应用到
  * Sentinel-2 预测变量上，生成 10 m 分辨率的降尺度 LST 产品。
+ * 随后基于 Sentinel-2 NDVI 与 10 m LST 构建 NDVI-LST 特征空间，
+ * 拟合湿边和干边，计算温度植被干旱指数（TVDI）。
  *
  * 将整个脚本复制到 Google Earth Engine Code Editor 中运行：
  * https://code.earthengine.google.com/
@@ -17,7 +19,7 @@
 
 // [需要修改：研究区]
 // 青岛矢量边界资产。请确认你的 GEE 账号有权限读取该资产。
-var ROI_ASSET = 'projects/python-478207/assets/qingdaoshp_wheat';
+var ROI_ASSET = 'projects/python-478207/assets/huantai';
 var roiFc = ee.FeatureCollection(ROI_ASSET);
 var roi = roiFc.geometry();
 
@@ -42,13 +44,32 @@ var REGRESSION_SCALE = 30;
 // [需要修改：导出路径]
 // 这里是 Export.image 使用的 Google Drive 文件夹和输出文件名前缀。
 var EXPORT_FOLDER = 'GEE_LST_Qingdao';
-var EXPORT_DESCRIPTION = 'Qingdao_LST_10m_20260201_20260515';
-var EXPORT_FILE_PREFIX = 'Qingdao_LST_10m_20260201_20260515';
+var EXPORT_DESCRIPTION = 'huantai_LST_10m_20260201_20260515';
+var EXPORT_FILE_PREFIX = 'huantai_LST_10m_20260201_20260515';
+var TVDI_EXPORT_DESCRIPTION = 'huantai_TVDI_10m_20260201_20260515';
+var TVDI_EXPORT_FILE_PREFIX = 'huantai_TVDI_10m_20260201_20260515';
 
 // 导出坐标系。EPSG:4326 便于共享；如果后续需要做面积或距离等度量分析，
 // 建议改用合适的投影坐标系。
 var EXPORT_CRS = 'EPSG:4326';
 var MAX_PIXELS = 1e13;
+
+// [需要根据研究区调试：TVDI 参数]
+// TVDI 公式：TVDI = (LST - LSTwet) / (LSTdry - LSTwet)。
+// 这里按 NDVI 分箱，在每个分箱内用 LST 低分位数作为湿边点、高分位数作为干边点。
+// 使用分位数而不是绝对最小/最大值，可以减少异常像元对边界拟合的影响。
+var TVDI_NDVI_MIN = 0.05;
+var TVDI_NDVI_MAX = 0.90;
+var TVDI_NDVI_BIN_WIDTH = 0.05;
+var TVDI_WET_PERCENTILE = 5;
+var TVDI_DRY_PERCENTILE = 95;
+var TVDI_MIN_PIXELS_PER_BIN = 30;
+
+// TVDI 有效像元筛选。水体和异常温度会明显拉歪干湿边，必要时按本地情况调整。
+var TVDI_LST_MIN = -20;
+var TVDI_LST_MAX = 60;
+var TVDI_NDWI_WATER_MAX = 0.30;
+var TVDI_MIN_EDGE_GAP_C = 0.5;
 
 // Landsat 回归和 Sentinel-2 应用中共同使用的预测变量。
 // BLUE/GREEN/RED/NIR 在 Sentinel-2 中是原生 10 m 波段。SWIR1 对应 Sentinel-2 B11，
@@ -290,7 +311,109 @@ var lst10mWithResiduals = lst10mNoResiduals
   .clip(roi);
 
 /*******************************************************************************
- * 5. 显示图层和诊断统计。
+ * 5. 基于 10 m LST 和 Sentinel-2 NDVI 计算 TVDI。
+ ******************************************************************************/
+
+var tvdiNdvi = sentinel2Composite.select('NDVI').rename('NDVI');
+var tvdiNdwi = sentinel2Composite.select('NDWI').rename('NDWI');
+var tvdiLst = lst10mWithResiduals.rename('LST');
+
+// 只保留适合构建 NDVI-LST 特征空间的像元：
+// 1) NDVI 在指定范围内；2) LST 在合理范围内；3) 排除高 NDWI 的疑似水体。
+var tvdiValidMask = tvdiNdvi.gte(TVDI_NDVI_MIN)
+  .and(tvdiNdvi.lte(TVDI_NDVI_MAX))
+  .and(tvdiLst.gte(TVDI_LST_MIN))
+  .and(tvdiLst.lte(TVDI_LST_MAX))
+  .and(tvdiNdwi.lt(TVDI_NDWI_WATER_MAX));
+
+var tvdiInput = tvdiNdvi
+  .addBands(tvdiLst)
+  .updateMask(tvdiValidMask)
+  .clip(roi);
+
+var tvdiBinStarts = ee.List.sequence(
+  TVDI_NDVI_MIN,
+  ee.Number(TVDI_NDVI_MAX).subtract(TVDI_NDVI_BIN_WIDTH),
+  TVDI_NDVI_BIN_WIDTH
+);
+
+// 每个 NDVI 分箱提取一个湿边点和一个干边点。
+var tvdiEdgeSamples = ee.FeatureCollection(tvdiBinStarts.map(function(binStart) {
+  binStart = ee.Number(binStart);
+  var binEnd = binStart.add(TVDI_NDVI_BIN_WIDTH);
+  var binMask = tvdiNdvi.gte(binStart).and(tvdiNdvi.lt(binEnd));
+  var binLst = tvdiLst.updateMask(tvdiValidMask).updateMask(binMask);
+
+  var edgePercentiles = binLst.reduceRegion({
+    reducer: ee.Reducer.percentile(
+      [TVDI_WET_PERCENTILE, TVDI_DRY_PERCENTILE],
+      ['wet', 'dry']
+    ),
+    geometry: roi,
+    scale: OUTPUT_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: 4
+  });
+
+  var binCount = binLst.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: roi,
+    scale: OUTPUT_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: 4
+  });
+
+  return ee.Feature(null, {
+    ndvi_mid: binStart.add(binEnd).divide(2),
+    lst_wet: edgePercentiles.get('LST_wet'),
+    lst_dry: edgePercentiles.get('LST_dry'),
+    pixel_count: binCount.get('LST')
+  });
+}))
+  .filter(ee.Filter.notNull(['lst_wet', 'lst_dry', 'pixel_count']))
+  .filter(ee.Filter.gte('pixel_count', TVDI_MIN_PIXELS_PER_BIN));
+
+// 拟合湿边和干边：
+// LSTwet = wet_slope * NDVI + wet_intercept
+// LSTdry = dry_slope * NDVI + dry_intercept
+var tvdiWetFit = tvdiEdgeSamples.reduceColumns(
+  ee.Reducer.linearFit(),
+  ['ndvi_mid', 'lst_wet']
+);
+var tvdiDryFit = tvdiEdgeSamples.reduceColumns(
+  ee.Reducer.linearFit(),
+  ['ndvi_mid', 'lst_dry']
+);
+
+var wetSlope = ee.Number(tvdiWetFit.get('scale'));
+var wetIntercept = ee.Number(tvdiWetFit.get('offset'));
+var drySlope = ee.Number(tvdiDryFit.get('scale'));
+var dryIntercept = ee.Number(tvdiDryFit.get('offset'));
+
+var lstWetEdge = tvdiNdvi.multiply(wetSlope)
+  .add(wetIntercept)
+  .rename('LST_wet_edge');
+var lstDryEdge = tvdiNdvi.multiply(drySlope)
+  .add(dryIntercept)
+  .rename('LST_dry_edge');
+var tvdiEdgeGap = lstDryEdge.subtract(lstWetEdge).rename('LST_edge_gap');
+
+var tvdi = tvdiLst.subtract(lstWetEdge)
+  .divide(tvdiEdgeGap)
+  .rename('TVDI')
+  .updateMask(tvdiValidMask)
+  .updateMask(tvdiEdgeGap.gt(TVDI_MIN_EDGE_GAP_C))
+  .clamp(0, 1)
+  .clip(roi);
+
+print('TVDI NDVI-LST edge samples:', tvdiEdgeSamples);
+print('TVDI wet edge coefficients:',
+  ee.Dictionary({slope: wetSlope, intercept: wetIntercept}));
+print('TVDI dry edge coefficients:',
+  ee.Dictionary({slope: drySlope, intercept: dryIntercept}));
+
+/*******************************************************************************
+ * 6. 显示图层和诊断统计。
  ******************************************************************************/
 
 var lstStats = lst10mWithResiduals.reduceRegion({
@@ -305,6 +428,43 @@ var lstStats = lst10mWithResiduals.reduceRegion({
 });
 
 print('Final 10 m LST statistics (degree Celsius):', lstStats);
+
+var tvdiStats = tvdi.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: roi,
+  scale: OUTPUT_SCALE,
+  maxPixels: MAX_PIXELS,
+  tileScale: 4
+});
+
+print('TVDI statistics:', tvdiStats);
+
+var tvdiScatterSamples = tvdiInput.sample({
+  region: roi,
+  scale: OUTPUT_SCALE,
+  numPixels: 5000,
+  seed: 20260515,
+  geometries: false,
+  tileScale: 4
+});
+
+var tvdiScatterChart = ui.Chart.feature.byFeature(
+    tvdiScatterSamples,
+    'NDVI',
+    ['LST']
+  )
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'NDVI-LST feature space for TVDI',
+    hAxis: {title: 'NDVI'},
+    vAxis: {title: 'LST (degree Celsius)'},
+    pointSize: 1,
+    legend: {position: 'none'}
+  });
+print(tvdiScatterChart);
 
 var lstVis = {
   min: 0,
@@ -322,6 +482,21 @@ var residualVis = {
   palette: ['2166ac', 'f7f7f7', 'b2182b']
 };
 
+var ndviVis = {
+  min: TVDI_NDVI_MIN,
+  max: TVDI_NDVI_MAX,
+  palette: ['b2182b', 'f7f7f7', '1a9850']
+};
+
+var tvdiVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    '2166ac', '67a9cf', 'd1e5f0', 'f7f7f7',
+    'fddbc7', 'ef8a62', 'b2182b'
+  ]
+};
+
 Map.addLayer(
   sentinel2Composite,
   {bands: ['RED', 'GREEN', 'BLUE'], min: 0.02, max: 0.3},
@@ -332,9 +507,13 @@ Map.addLayer(landsatComposite.select('LST'), lstVis, 'Landsat 8/9 LST composite 
 Map.addLayer(landsatResiduals30m, residualVis, 'Landsat regression residuals 30 m', false);
 Map.addLayer(lst10mNoResiduals, lstVis, 'LST 10 m no residuals', false);
 Map.addLayer(lst10mWithResiduals, lstVis, 'Final LST 10 m with residuals', true);
+Map.addLayer(tvdiNdvi.updateMask(tvdiValidMask), ndviVis, 'Sentinel-2 NDVI for TVDI', false);
+Map.addLayer(lstWetEdge.updateMask(tvdiValidMask), lstVis, 'TVDI wet edge LST', false);
+Map.addLayer(lstDryEdge.updateMask(tvdiValidMask), lstVis, 'TVDI dry edge LST', false);
+Map.addLayer(tvdi, tvdiVis, 'TVDI 10 m', true);
 
 /*******************************************************************************
- * 6. 导出最终 10 m LST。
+ * 7. 导出最终 10 m LST 和 TVDI。
  ******************************************************************************/
 
 // [需要修改：导出路径、输出分辨率]
@@ -344,6 +523,22 @@ Export.image.toDrive({
   description: EXPORT_DESCRIPTION,
   folder: EXPORT_FOLDER,
   fileNamePrefix: EXPORT_FILE_PREFIX,
+  region: roi,
+  scale: OUTPUT_SCALE,
+  crs: EXPORT_CRS,
+  maxPixels: MAX_PIXELS,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    cloudOptimized: true
+  }
+});
+
+// 导出 TVDI。TVDI 越接近 0，表示越湿润；越接近 1，表示越干旱。
+Export.image.toDrive({
+  image: tvdi,
+  description: TVDI_EXPORT_DESCRIPTION,
+  folder: EXPORT_FOLDER,
+  fileNamePrefix: TVDI_EXPORT_FILE_PREFIX,
   region: roi,
   scale: OUTPUT_SCALE,
   crs: EXPORT_CRS,

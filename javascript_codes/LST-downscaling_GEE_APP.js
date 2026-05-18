@@ -1,29 +1,28 @@
 /*
-Authors: Onačillová, K., Gallay, M., Paluba, D., Péliová, A., Tokarčík, O., Laubertová, D. 
-(For more info contact: katarina.onacillova@upjs.sk)
+作者：Onačillová, K., Gallay, M., Paluba, D., Péliová, A., Tokarčík, O., Laubertová, D. 
+（更多信息请联系：katarina.onacillova@upjs.sk）
 
-This code is free and open. 
-By using this code and any data derived with it, 
-you agree to cite the following reference 
-in any publications derived from them:
+本代码免费且开源。 
+使用本代码及其派生数据时， 
+请在相关发表成果中引用以下文献：
  
     Onačillová, K., Gallay, M., Paluba, D., Péliová, A., Tokarčík, O., Laubertová, D. 2022: 
-    Combining Landsat 8 and Sentinel 2 data in Google Earth Engine 
-    to derive higher resolution land surface temperature maps in urban environment
+    在 Google Earth Engine 中结合 Landsat 8 与 Sentinel 2 数据，
+    生成城市环境中更高分辨率的地表温度图
 
-This function selects the Landsat 8 and Sentinel 2 data based on user inputs
-and performes the downscaling of LST
+本函数根据用户输入选择 Landsat 8 和 Sentinel 2 数据，
+并执行地表温度（LST）降尺度。
 
 ###########################################################################################################################################################################
 */
 
-// Set up panels and widgets for display 
-// Set up title and summary widgets
+// 设置用于显示的面板和控件。
+// 设置标题和摘要控件。
 
-// // drawing tools
+// // 绘图工具
 // var drawingTools = Map.drawingTools();
 
-// // Use the addLayer method on the drawing tools directly.
+// // 直接在绘图工具上使用 addLayer 方法。
 // var geometries = [ee.Geometry.Polygon(
 //         [[[21.134189623651263, 48.82947658234015],
 //           [21.134189623651263, 48.57888560664585],
@@ -31,27 +30,27 @@ and performes the downscaling of LST
 //           [21.433567065057513, 48.82947658234015]]], null, false)];
 
 // drawingTools.addLayer(geometries, 'my_geometry1', 'red');
-// This sets the available draw modes. point and line would also be available
+// 设置可用的绘制模式；点和线模式也可以启用。
 
 var map = ui.Map();
-// Prints true since drawingTools() adds drawing tools to the map.
+// drawingTools() 会向地图添加绘图工具，因此这里会返回 true。
 map.drawingTools().setDrawModes(["polygon", "rectangle"])
-// Replace the default Map with the newly created map.
+// 用新建的地图替换默认 Map。
 ui.root.widgets().reset([map]);
 
-// App title
+// 应用标题。
 var header = ui.Label('Landsat Land Surface Temperature downscaling using Sentinel-2', {fontSize: '23px', fontWeight: 'bold', color: '77797e'});
 
-// App summary
+// 应用摘要。
 var text = ui.Label(
   'Landsat land surface temperature downscaled at 10 m by Sentinel-2 data. ' +
   'Developed for urban management.',
     {fontSize: '15px'});
 
-// App title2
+// 第二个标题。
 var header2 = ui.Label('How to cite:', {fontSize: '16px', fontWeight: 'bold', margin:'0px 0px -5px 8px'});
 
-// App summary2
+// 第二段摘要。
 var text2 = ui.Label(
   'Onačillová, K.; Gallay, M.; Paluba, D.; Péliová, A.; Tokarčík, O.; Laubertová, D. Combining Landsat 8 and Sentinel-2 Data in Google Earth Engine to Derive Higher Resolution Land Surface Temperature Maps in Urban Environment. Remote Sens. 2022, 14, 4076.',
     {fontSize: '15px', margin:'5px 0px 0px 8px'});
@@ -60,32 +59,32 @@ var textLink = ui.Label(' https://doi.org/10.3390/rs14164076',
   {fontSize: '15px', margin:'0px 0px 0px 8px',color:'blue'})
   .setUrl('https://doi.org/10.3390/rs14164076');
   
-// Create a panel to hold text
+// 创建用于放置文字的面板。
 var panel = ui.Panel({
-  widgets:[header, text, header2],//Adds header and text
+  widgets:[header, text, header2],// 添加标题和文字。
   style:{width: '500px',position:'middle-right', margin: '10px'}});
 
 panel.add(text2)
 panel.add(textLink)  
 
-// Create variable for additional text and separators
+// 创建用于附加文字和分隔线的变量。
 
-// This creates another panel to house a line separator and instructions for the user
+// 创建另一个面板，用来放置分隔线和用户说明。
 var intro = ui.Panel([
   ui.Label({
     value: '__________________________________________________________',
     style: {fontWeight: 'bold',  color: '77797e'},
   })]);
 
-// Add panel to the larger panel 
+// 将该面板添加到更大的主面板中。
 panel.add(intro)
 
-// Add main panel to the root of GUI
+// 将主面板添加到 GUI 根节点。
 ui.root.insert(1,panel)
 
 
 
-// Defining startDate and endDate in the UI
+// 在界面中定义开始日期和结束日期。
 var dateLabel = ui.Label({
     value:'Select start and end dates to find a proper L8/9 and S2 image pair',
     style: {fontWeight: 'bold', fontSize: '14px', margin: '10px 5px'}
@@ -110,11 +109,11 @@ var Landsat_collection_label = ui.Label('Choose a Landsat Collection',
 var cloudSliderLabel = ui.Label('Set the maximum cloud coverage (in %)',
   {fontWeight: 'bold', fontSize: '14px', margin:'5px 0px 0px 8px'});
 
-// Define labels for Landsat 8 and 9 Collections
+// 定义 Landsat 8 和 9 影像集合的标签。
 var L8 = 'Landsat 8 Image Collection',
     L9 = 'Landsat 9 Image Collection';
 
-// Define the select button for the AOI
+// 定义选择 AOI/影像集合的下拉控件。
 var selectCollection = ui.Select({
   items:[L8,L9],
   placeholder:'Select Landsat Collection',value: 'Landsat 8 Image Collection'
@@ -130,7 +129,7 @@ function setLandsatCollection(){
   }
 };
 
-// Add a slider bar widget
+// 添加滑块控件。
 var cloudSlider = ui.Slider({min:0,max:100, style:{width:'200px'}}).setValue(5);
 
 var GenerateImagesButton = ui.Button('Generate Landsat 8/9 and Sentinel-2 Image Collections', generateImsButton);
@@ -168,10 +167,10 @@ panel.add(appUseText1)
   .add(cloudSlider)
   .add(GenerateImagesButton);
 
-// Define input parameters
+// 定义输入参数。
 var startDate = startDate_selected.getValue(),
     endDate = endDate_selected.getValue(),
-    collection = selectCollection.getValue(), // select "L8" or "L9"
+    collection = selectCollection.getValue(), // 选择 "L8" 或 "L9"。
     // selected_geometry = map.drawingTools().layers().get(0).toGeometry(),
     cloud_cover = ee.Number(cloudSlider.getValue());
 
@@ -184,7 +183,7 @@ var ROI = /* color: #98ff00 */ee.Geometry.Polygon(
 map.centerObject(ROI,12);
 map.drawingTools().addLayer([ROI], 'ROI', 'green')
 
-// Create a panel to hold the the next part.
+// 创建用于放置下一部分内容的面板。
 var panel2 = ui.Panel();
 panel2.style().set({
   width: '500px',
@@ -197,22 +196,22 @@ function generateImsButton () {
 var selected_geometry = map.drawingTools().layers().get(0).toGeometry();
 // var selected_geometry = ROI;
 
-  // Set image collection conditions
+  // 设置影像集合筛选条件。
 if (selectCollection.getValue() == "Landsat 8 Image Collection") {
   var collection_id = "LANDSAT/LC08/C02/T1_L2";
 } 
 if (selectCollection.getValue() == "Landsat 9 Image Collection") {
   var collection_id = "LANDSAT/LC09/C02/T1_L2";
 } 
-//Select Landsat 8 Surface Reflectance dataset coverage 
-var Landsat_collection = ee.ImageCollection(collection_id)      //Select the ImageCollection
-                    .filterBounds(selected_geometry)                         //Filter the ImageCollection by your study area
-                    .filterDate(startDate_selected.getValue(), endDate_selected.getValue())            //Filter the ImageCollection by the date interval
-                    .filterMetadata("CLOUD_COVER", "less_than", ee.Number(cloudSlider.getValue()));   //Filter the ImageCollection by the % of the cloud cover
-print(Landsat_collection, "- available Landsat images","that meet the input criteria"); /*Print available features (datasets) of Landsat_collection 
-                                        that meet the input criteria - see the results in the Console window*/
+// 选择 Landsat 8 地表反射率数据覆盖范围。
+var Landsat_collection = ee.ImageCollection(collection_id)      // 选择影像集合。
+                    .filterBounds(selected_geometry)                         // 按研究区筛选影像集合。
+                    .filterDate(startDate_selected.getValue(), endDate_selected.getValue())            // 按日期区间筛选影像集合。
+                    .filterMetadata("CLOUD_COVER", "less_than", ee.Number(cloudSlider.getValue()));   // 按云量百分比筛选影像集合。
+print(Landsat_collection, "- available Landsat images","that meet the input criteria"); /* 打印满足输入条件的 Landsat_collection 可用要素（数据集）；
+                                        结果可在 Console 窗口中查看。 */
 
-//Select Sentinel-2 Level-2A collection dataset coverage 
+// 选择 Sentinel-2 Level-2A 影像集合数据覆盖范围。
 var S2_collection = ee.ImageCollection("COPERNICUS/S2_SR")
                 .filterBounds(selected_geometry)
                 .filterDate(startDate_selected.getValue(), endDate_selected.getValue())
@@ -289,7 +288,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   panel2.add(otherPartsButton);
   
-  // Create a panel to hold the the next part.
+  // 创建用于放置下一部分内容的面板。
   var panel3 = ui.Panel();
   panel3.style().set({
     width: '500px',
@@ -299,7 +298,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
 
   function GenerateOtherParts () {
-    // reset the map
+    // 重置地图。
     panel3.clear();
     map.layers().reset();
     
@@ -309,9 +308,9 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
     var sentinel_dataset_ID = ee.String('COPERNICUS/S2_SR/');
     
-    // To be filled after the first RUN
-    var S2_selected_dataset = ee.Image(ee.String(ee.String(sentinel_dataset_ID).cat(ee.String(S2ID.getValue()))).getInfo()), //Select one feature (dataset) of the printed S2_collection
-        Landsat_selected_dataset = ee.Image(ee.String(ee.String(collection_id).cat('/').cat(ee.String(LandsatID.getValue()))).getInfo()); //Select one feature (dataset) of the printed Landsat_collection
+    // 第一次运行后填写影像 ID。
+    var S2_selected_dataset = ee.Image(ee.String(ee.String(sentinel_dataset_ID).cat(ee.String(S2ID.getValue()))).getInfo()), // 从打印出的 S2_collection 中选择一个要素（数据集）。
+        Landsat_selected_dataset = ee.Image(ee.String(ee.String(collection_id).cat('/').cat(ee.String(LandsatID.getValue()))).getInfo()); // 从打印出的 Landsat_collection 中选择一个要素（数据集）。
     
     var S2_date = S2_selected_dataset.get('system:time_start');
     var S2_StartDate = ee.Date(S2_date).format('YYYY-MM-dd');
@@ -321,23 +320,23 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
     var L_StartDate = ee.Date(L_date).format('YYYY-MM-dd');
     var L_EndDate = ee.Date(ee.Number.parse(L_date).add(86400000)).format('YYYY-MM-dd');
     
-    //Select Landsat 8 Surface Reflectance dataset coverage 
-    var selected_Landsat_collection = ee.ImageCollection(collection_id)      //Select the ImageCollection
-                        .filterBounds(selected_geometry)                         //Filter the ImageCollection by your study area
-                        .filterDate(L_StartDate, L_EndDate)            //Filter the ImageCollection by the date interval
-                        .filterMetadata("CLOUD_COVER", "less_than", ee.Number(cloudSlider.getValue()))   //Filter the ImageCollection by the % of the cloud cover
+    // 选择 Landsat 8 地表反射率数据覆盖范围。
+    var selected_Landsat_collection = ee.ImageCollection(collection_id)      // 选择影像集合。
+                        .filterBounds(selected_geometry)                         // 按研究区筛选影像集合。
+                        .filterDate(L_StartDate, L_EndDate)            // 按日期区间筛选影像集合。
+                        .filterMetadata("CLOUD_COVER", "less_than", ee.Number(cloudSlider.getValue()))   // 按云量百分比筛选影像集合。
                         .first();
     
     Landsat_selected_dataset = selected_Landsat_collection
     
-    //Select Sentinel-2 Level-2A collection dataset coverage 
+    // 选择 Sentinel-2 Level-2A 影像集合数据覆盖范围。
     var selected_S2_collection = ee.ImageCollection("COPERNICUS/S2_SR")
                     .filterBounds(selected_geometry)
                     .filterDate(S2_StartDate, S2_EndDate)
                     .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", ee.Number(cloudSlider.getValue()))
                     .median();
     
-    // Apply Scaling factors to Landsat 8/9 Collection 2 images
+    // 对 Landsat 8/9 Collection 2 影像应用缩放系数。
     function applyScaleFactors(image) {
       var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2).multiply(10000);
       var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0).subtract(273.15);
@@ -348,7 +347,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   // Landsat_collection = Landsat_collection.map(applyScaleFactors);
   Landsat_selected_dataset = applyScaleFactors(Landsat_selected_dataset);
   
-  //Visualization parameters for color compositions RGB, CIR
+  // RGB 和彩色红外（CIR）合成的可视化参数。
   var vizParams2 = {bands: ['SR_B4', 'SR_B3', 'SR_B2'],
                     min: 0,
                     max: 3000,
@@ -361,23 +360,23 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   // ####################################################################################################################
   
-  //Visualise the Landsat 8 Surface Reflectance image as a natural colour image (30m spatial resolution)
+  // 将 Landsat 8 地表反射率影像显示为自然彩色影像（30 m 空间分辨率）。
   
   var L8_image = Landsat_selected_dataset.clip(selected_geometry);
   print(L8_image, 'Landsat-8 clipped Landsat_selected_dataset');
   
   // Map.addLayer(L8_image, vizParams2, "L8_image 30m", 0);
   
-  //Select and visualise the Landsat 8 Surface Reflectance image as a colour infrared image (30m spatial resolution).
+  // 选择并显示 Landsat 8 地表反射率彩色红外影像（30 m 空间分辨率）。
   // var image2 = ee.Image("LANDSAT/LC08/C01/T1_SR/LC08_186026_20180823").clip(selected_geometry);
   
   // Map.addLayer(image2, vizParams3, "L8 CIR 30m", 0);
   
   // ####################################################################################################################
   
-  //Calculate Landsat 8 spectral indices NDVI, NDWI and NDBI
+  // 计算 Landsat 8 光谱指数 NDVI、NDWI 和 NDBI。
   
-  //Landsat 8 NDVI (30m spatial resolution)
+  // Landsat 8 NDVI（30 m 空间分辨率）。
   var ndvi = Landsat_selected_dataset.normalizedDifference(['SR_B5', 'SR_B4']).rename('ndvi');
   var ndviParams = {min: -1, max: 1, palette: ['purple', 'pink', 'green']};
   var ndviclipped = ndvi.clip(selected_geometry);
@@ -385,14 +384,14 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   // Map.addLayer(ndviclipped, ndviParams, 'L8_ndvi', 0);
   
   
-  //Landsat 8 NDWI (30m spatial resolution).
+  // Landsat 8 NDWI（30 m 空间分辨率）。
   var ndwi = Landsat_selected_dataset.normalizedDifference(['SR_B3', 'SR_B5']).rename('ndwi');
   var ndwiParams = {min: -1, max: 1, palette: ['green', 'yellow', 'red', 'blue', 'navy']};
   var ndwiclipped = ndwi.clip(selected_geometry);
   //print(ndwiclipped,'ndwi');
   //Map.addLayer(ndwiclipped, ndwiParams, 'L8_ndwi');
   
-  //Landsat 8 NDBI (30m spatial resolution).
+  // Landsat 8 NDBI（30 m 空间分辨率）。
   var ndbi = Landsat_selected_dataset.normalizedDifference(['SR_B6', 'SR_B5']).rename('ndbi');
   var ndbiParams = {min: -1, max: 1, palette: ['blue', 'yellow', 'red']};
   var ndbiclipped = ndbi.clip(selected_geometry);
@@ -402,10 +401,10 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   // ####################################################################################################################
   
-  //Calculate Landsat 8 LST in Celsius Degrees (30m spatial resolution))
+  // 计算 Landsat 8 摄氏度 LST（30 m 空间分辨率）。
   var L8_LST_30m = L8_image.select('ST_B10').rename('L8_LST_30m');
   
-  //min max L8_LST_30m
+  // 计算 L8_LST_30m 的最小值和最大值。
   var min = ee.Number(L8_LST_30m.reduceRegion({
             reducer: ee.Reducer.min(),
             scale: 30,
@@ -421,7 +420,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   print("Landsat 8 LST range (°C)", 
         "- 30m spatial resolution:", "", min, 'min L8 LST (30m)', "", max, 'max L8 LST (30m)');
   
-  // Map.addLayer(L8_LST_30m, {min: 21.157310795087767, max:41.58105080520278, //set LST min max
+  // Map.addLayer(L8_LST_30m, {min: 21.157310795087767, max:41.58105080520278, // 设置 LST 最小值和最大值。
   //             palette: ['040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
   //                       '0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
   //                       //'3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 
@@ -447,31 +446,31 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   // ####################################################################################################################
   
-  // //Select and visualise the Sentinel 2 image as a natural colour image (10m spatial resolution).
+  // // 选择并显示 Sentinel 2 自然彩色影像（10 m 空间分辨率）。
   // Map.addLayer(S2_image, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.23}, 'S2 RGB 10m', 0);
   
-  // //Select and visualise the Sentinel 2 image as a colour infrared image (10m spatial resolution).
+  // // 选择并显示 Sentinel 2 彩色红外影像（10 m 空间分辨率）。
   // Map.addLayer(S2_image, {bands: ['B8', 'B4', 'B3'], min: 0, max: 0.23}, 'S2 CIR 10m', 0);
   
   // ####################################################################################################################
   
-  //Calculate Sentinel 2 spectral indices NDVI, NDWI and NDBI
+  // 计算 Sentinel 2 光谱指数 NDVI、NDWI 和 NDBI。
   
-  //Sentinel 2 NDVI (10m spatial resolution).
+  // Sentinel 2 NDVI（10 m 空间分辨率）。
   var S2_ndvi = S2_image.normalizedDifference(['B8', 'B4']).rename('S2_NDVI');
   var S2_ndviParams4 = {min: -1, max: 1, palette: ['purple', 'pink', 'green']};
   var S2_ndviclipped = S2_ndvi.clip(selected_geometry);
   //print(S2_ndviclipped,'S2_ndvi');
   //Map.addLayer(S2_ndviclipped, S2_ndviParams4, 'S2_ndvi');
   
-  //Sentinel 2 NDWI (10m spatial resolution).
+  // Sentinel 2 NDWI（10 m 空间分辨率）。
   var S2_ndwi = S2_image.normalizedDifference(['B3', 'B11']).rename('S2_NDWI');
   var S2_ndwiParams4 = {min: -1, max: 1, palette: ['green', 'yellow', 'red', 'blue', 'navy']};
   var S2_ndwiclipped = S2_ndwi.clip(selected_geometry);
   //print(S2_ndwiclipped,'S2_ndwi');
   //Map.addLayer(S2_ndwiclipped, S2_ndwiParams4, 'S2_ndwi');
   
-  //Sentinel 2 NDBI (10m spatial resolution).
+  // Sentinel 2 NDBI（10 m 空间分辨率）。
   var S2_ndbi = S2_image.normalizedDifference(['B11', 'B8']).rename('S2_NDBI');
   var S2_ndbiParams4 = {min: -1, max: 1, palette: ['blue', 'yellow', 'purple']};
   var S2_ndbiclipped = S2_ndbi.clip(selected_geometry);
@@ -480,12 +479,12 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   
   // ####################################################################################################################
-  //Create CHART for linearRegression
+  // 为线性回归创建图表数据。
   
   var imgForChart = L8_LST_30m.addBands([ndvi,ndwi,ndbi])
   var randomPoints = ee.FeatureCollection.randomPoints(selected_geometry, 500, 40);
 
-  // Add values of image bands to the "points"
+  // 将影像波段值添加到随机点中。
   var pointsWithValue = imgForChart.reduceRegions({
       collection: randomPoints,
       reducer: ee.Reducer.mean(),
@@ -495,7 +494,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   var getValues = ee.FeatureCollection(pointsWithValue.filter(ee.Filter.notNull(['L8_LST_30m', 'ndvi', 'ndwi', 'ndbi'])));
 
   
-  // Functions to create arrays containing all the values (LIA, VH and VV) of selected points
+  // 创建数组，用于存放所选点的 LST、NDVI、NDWI 和 NDBI 值。
   var LST_points = getValues.aggregate_array('L8_LST_30m');
   var NDVI_points = getValues.aggregate_array('ndvi');
   var NDWI_points = getValues.aggregate_array('ndwi');
@@ -505,19 +504,19 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
 
 
   // ##########################################################################
-  // Regression Calculation 
+  // 回归计算。
   
-  // preparing bands
+  // 准备用于回归的波段。
   var bands = ee.Image(1).addBands(ndvi).addBands(ndbi).addBands(ndwi).addBands(L8_LST_30m).rename(["constant", "ndvi", "ndbi", "ndwi", "L8"]);
   
-  // run the multiple regression analysis
+  // 运行多元线性回归分析。
   var imageRegression = bands.reduceRegion({
                         reducer: ee.Reducer.linearRegression({numX:4, numY:1}),
                         geometry: selected_geometry,
                         scale: 30,
                         });
   
-  // create images from coefficients
+  // 根据回归系数创建影像。
   print ("", "* Multipe linear regression model" ,"coefficients for Landsat 8 LST downscaling")
   var coefList2 = ee.Array(imageRegression.get("coefficients")).toList();
   var intercept2 = ee.Image(ee.Number(ee.List(coefList2.get(0)).get(0)));
@@ -534,15 +533,15 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
         slopeNDBI2_list, "slope NDBI", "",
         slopeNDWI2_list, "slope NDWI");
   
-  // calculate the final downscaled image
+  // 计算最终的降尺度影像。
   var downscaled_LST_10m = ee.Image(intercept2).add(slopeNDVI2.multiply(S2_ndvi))
               .add(slopeNDBI2.multiply(S2_ndbi)).add(slopeNDWI2.multiply(S2_ndwi));
   
-  // add to map
+  // 添加到地图。
   //Map.addLayer(downscaled_LST_10m, lstParams2, 'S2-LST 10m');
   
   // #######################################################################
-  // L8-LST 30 m model calculation
+  // 计算 30 m Landsat 8/9 LST 模型值。
   
   var L8_LST_MODEL = intercept2.add(slopeNDVI2.multiply(ndvi))
               .add(slopeNDBI2.multiply(ndbi))
@@ -556,19 +555,19 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
                         'd6e21f', 'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
                         'ff0000', 'de0101', 'c21301', 'a71001', '911003'];
   
-  // Map.addLayer(L8_LST_MODEL, {min: 21.157310795087767, max:41.58105080520278, //set LST min max
+  // Map.addLayer(L8_LST_MODEL, {min: 21.157310795087767, max:41.58105080520278, // 设置 LST 最小值和最大值。
   //             palette: palette}, 'L8_LST_MODEL');
   
   
   // ####################################################################### 
-  // Gaussian convolution
+  // 高斯卷积。
   
-  // Define a gaussian kernel
+  // 定义高斯核。
   var gaussian = ee.Kernel.gaussian({
     radius: 1.5, units: 'pixels'
   });
   
-  // Smooth the image by convolving with the gaussian kernel.
+  // 通过高斯核卷积对影像进行平滑。
   var L8_RESIDUALS_gaussian = L8_RESIDUALS.resample("bicubic").convolve(gaussian);
   
   var visParam_residuals = {
@@ -581,7 +580,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   // Map.addLayer(L8_RESIDUALS_gaussian, visParam_residuals, "L8_RESIDUALS_gaussian",false);
   
   // 
-  // Calculate the final downscaled LSTs
+  // 计算最终降尺度后的 LST。
   var downscaled_LST_10m2 = ee.Image(intercept2).add(slopeNDVI2.multiply(S2_ndvi))
                 .add(slopeNDBI2.multiply(S2_ndbi)).add(slopeNDWI2.multiply(S2_ndwi));
   
@@ -610,7 +609,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
                             'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
                             'ff0000', 'de0101', 'c21301', 'a71001', '911003']};
 
-  // Export the final image to Drive
+  // 将最终影像导出到 Google Drive。
   Export.image.toDrive({
     image: S2_LST_10_w_Residuals,
     description: 'Downscaled_LST_usingS2_10m',
@@ -628,18 +627,18 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   
   
   // ##################################################################### //
-  // #################### User interface preparation ##################### //
+  // ######################## 用户界面准备 ############################### //
   // ##################################################################### //
   
-  // Inspiration was taken from Abigail Barenblitt & Temilola Fatoyinbo presentation and code available at
+  // 用户界面设计参考了 Abigail Barenblitt 和 Temilola Fatoyinbo 的演示与代码：
   // https://appliedsciences.nasa.gov/sites/default/files/2020-10/Part3App_Final.pdf
   // https://code.earthengine.google.com/705e6c7974f42373f1b9535e2bd40243
   
-  // Setting up map appearance and app layers 
-  // Center the map to the selected_geometry
+  // 设置地图外观和应用图层。
+  // 将地图中心定位到 selected_geometry。
   Map.centerObject(selected_geometry,12); 
   
-  // Create variables for GUI layers for each layer 
+  // 为每个 GUI 图层创建变量。
   var L8_image_viz = ui.Map.Layer(L8_image, vizParams2, "Landsat 8/9 RGB",false);
   var S2_image_viz = ui.Map.Layer(S2_image, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.23}, 'Sentinel-2 RGB',false);
   var L8_LST_viz = ui.Map.Layer(L8_LST_30m, lstParams2,'L8-LST 30m', false);
@@ -648,7 +647,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   var L8_LST_10_with_Residuals = ui.Map.Layer(S2_LST_10_w_Residuals, lstParams2, "S2-LST 10m with residuals", true);
   
 
-  // Add layers to the map
+  // 将图层添加到地图。
   map.add(L8_image_viz);
   map.add(S2_image_viz);
   map.add(residuals_layer);
@@ -657,7 +656,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   map.add(L8_LST_10_with_Residuals);
   
   ///////////////////////////////////////////////////////////////
-  //            Add checkbox widgets and legends               //
+  //                添加复选框控件和图例                       //
   ///////////////////////////////////////////////////////////////
   
   var selectLayerLabel = ui.Label({
@@ -665,7 +664,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
       style: {fontWeight: 'bold', fontSize: '16px', margin: '10px 0 0 10px'}
     });
   
-  // Add checkboxes to our display
+  // 将复选框添加到界面。
   var additionalCheck = ui.Checkbox('Landsat 8/9 RGB').setValue(false); 
   var additionalCheck2 = ui.Checkbox('Sentinel-2 RGB').setValue(false);
   var additionalCheck3 = ui.Checkbox('Landsat 8/9 LST').setValue(false);
@@ -674,8 +673,8 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   var additionalCheck6 = ui.Checkbox('LST 10 m with residuals').setValue(true); 
   var additionalCheck7 = ui.Checkbox('ROI').setValue(false); 
 
-  // Create legend
-  // Set position of panel
+  // 创建图例。
+  // 设置图例面板位置。
   var legend = ui.Panel({
     style: {
       position: 'bottom-left',
@@ -683,26 +682,26 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
     }
   });
   
-  // The following creates and styles 1 row of the legend.
+  // 下面的函数用于创建并设置图例中的一行。
   var makeRowa = function(color, name) {
    
-        // Create the label that is actually the colored box.
+        // 创建实际显示为色块的标签。
         var colorBox = ui.Label({
           style: {
             backgroundColor: '#' + color,
-            // Use padding to give the box height and width.
+            // 使用 padding 设置色块的高度和宽度。
             padding: '8px',
             margin: '0 0 4px 0'
           }
         });
    
-        // Create a label with the description text.
+        // 创建包含说明文字的标签。
         var description = ui.Label({
           value: name,
           style: {margin: '0 0 4px 6px'}
         });
    
-        // Return the panel
+        // 返回这一行图例面板。
         return ui.Panel({
           widgets: [colorBox, description],
           layout: ui.Panel.Layout.Flow('horizontal')
@@ -710,15 +709,14 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   };
   
   
-  // Legend
-  // Legend Label
+  // 图例。
+  // 图例标题。
   var legendLabel = ui.Label({value:'Land Surface Temperature (°C)',
   style: {fontWeight: 'bold', fontSize: '16px', margin: '10px 0 0 10px'}
   });
   
-  // This uses function to construct a legend for the given single-band vis
-  // parameters.  Requires that the vis parameters specify 'min' and 
-  // 'max' but not 'bands'.
+  // 该函数根据给定的单波段可视化参数构建图例。
+  // 要求可视化参数包含 'min' 和 'max'，但不包含 'bands'。
   function makeLegend (params) {
     var lon = ee.Image.pixelLonLat().select('longitude');
     var gradient = lon.multiply((params.max-params.min)/100.0).add(params.min);
@@ -747,7 +745,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   var ChartButton = ui.Button('Generate charts of spectral indices vs Landsat 8/9 LST', GenerateCharts);
   
   
-  // Add widgets to the panel in an order
+  // 按顺序将控件添加到面板。
   panel3.add(selectLayerLabel)
         .add(additionalCheck6)
         .add(additionalCheck5)
@@ -760,7 +758,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
         .add(makeLegend(lstParams2))
         .add(ChartButton)
   
-    // Create a panel to hold the the next part.
+    // 创建用于放置下一部分内容的面板。
   var panel5 = ui.Panel();
   panel5.style().set({
     width: '500px',
@@ -778,7 +776,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
       hAxis: {title: 'NDVI'},
       vAxis: {title: 'LST (°C)'},
       series: {
-          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // observations
+          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // 观测点。
         },
       trendlines: {
           0: {
@@ -797,7 +795,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
       hAxis: {title: 'NDWI'},
       vAxis: {title: 'LST (°C)'},
       series: {
-          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // observations
+          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // 观测点。
         },
       trendlines: {
           0: {
@@ -816,7 +814,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
       hAxis: {title: 'NDBI'},
       vAxis: {title: 'LST (°C)'},
       series: {
-          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // observations
+          0: {pointSize: 1, color: 'blue',visibleInLegend: false}, // 观测点。
         },
       trendlines: {
           0: {
@@ -833,13 +831,13 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   } 
   
   ///////////////////////////////////////////////////////////////
-  //             Add functionality to widgets                  //
+  //                为控件添加交互功能                         //
   ///////////////////////////////////////////////////////////////
   
-  //For each checkbox we create function so that clicking the checkbox
-  //Turns on layers of interest
+  // 为每个复选框创建函数；
+  // 点击复选框即可打开或关闭相应图层。
   
-  // L8_image
+  // Landsat 8/9 RGB 图层。
   var doCheckbox = function() {
     
     additionalCheck.onChange(function(checked){
@@ -848,7 +846,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   }
   doCheckbox();
   
-  // S2_RGB
+  // Sentinel-2 RGB 图层。
   var doCheckbox2 = function() {
     
     additionalCheck2.onChange(function(checked){
@@ -859,7 +857,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   }
   doCheckbox2();
   
-  // L8_LST
+  // Landsat 8/9 LST 图层。
   var doCheckbox3 = function() {
     
     additionalCheck3.onChange(function(checked){
@@ -870,7 +868,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   }
   doCheckbox3();
   
-  // Residuals
+  // 残差图层。
   var doCheckbox4 = function() {
     
     additionalCheck4.onChange(function(checked){
@@ -879,7 +877,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   }
   doCheckbox4();
   
-  // LST 10 m without residuals
+  // 不含残差的 10 m LST 图层。
   var doCheckbox5 = function() {
     
     additionalCheck5.onChange(function(checked){
@@ -890,7 +888,7 @@ if ((Landsat_collection.size().getInfo() > 0) && (S2_collection.size().getInfo()
   }
   doCheckbox5();
   
-  // FINAL downscaled image with residuals
+  // 含残差的最终降尺度影像图层。
   var doCheckbox6 = function() {
     
     additionalCheck6.onChange(function(checked){
