@@ -1,0 +1,582 @@
+/*
+ * Google Earth Engine 中的桓台地表温度（LST）10 m 降尺度与 TVDI 计算脚本
+ *
+ * 用途
+ * -------
+ * 以 Landsat 8/9 Collection 2 Level-2 地表温度作为粗分辨率基础 LST，
+ * 使用 Landsat 光谱波段和指数建立回归模型，再把该模型应用到
+ * Sentinel-2 预测变量上，生成 10 m 分辨率的降尺度 LST 产品。
+ * 随后基于 Sentinel-2 NDVI 与 10 m LST 构建 NDVI-LST 特征空间，
+ * 拟合湿边和干边，计算温度植被干旱指数（TVDI）。
+ *
+ * 将整个脚本复制到 Google Earth Engine Code Editor 中运行：
+ * https://code.earthengine.google.com/
+ */
+
+/*******************************************************************************
+ * 1. 用户参数 - 将脚本用于其他研究区时，需要修改这些参数。
+ ******************************************************************************/
+
+// [需要修改：研究区]
+// 桓台矢量边界资产。请确认你的 GEE 账号有权限读取该资产。
+var ROI_ASSET = 'projects/python-478207/assets/huantai';
+var roiFc = ee.FeatureCollection(ROI_ASSET);
+var roi = roiFc.geometry();
+
+// [需要修改：批量导出时间范围]
+// GEE 的 filterDate 包含 BATCH_START_DATE，但不包含 BATCH_END_DATE。
+// 这里设置为 2026-02-01 至 2026-05-22；为包含 2026-05-22，结束日期写作 2026-05-23。
+var BATCH_START_DATE = '2026-02-01';
+var BATCH_END_DATE = '2026-05-23';
+
+// 对每一景符合条件的 Sentinel-2 影像，使用其成像日前后若干天的 Landsat 8/9
+// 数据拟合 LST 回归模型。7 表示 [-7, +7] 天窗口。
+var LANDSAT_WINDOW_DAYS = 7;
+var MIN_LANDSAT_IMAGES_FOR_DATE = 1;
+
+// [需要修改：云量阈值]
+// Landsat 使用 CLOUD_COVER 字段；Sentinel-2 使用 CLOUDY_PIXEL_PERCENTAGE 字段。
+var LANDSAT_CLOUD_MAX = 30;
+var SENTINEL2_CLOUD_MAX = 30;
+
+// [需要修改：输出分辨率]
+// 最终降尺度 LST 的导出分辨率。Sentinel-2 原生 B2/B3/B4/B8 波段为 10 m。
+var OUTPUT_SCALE = 10;
+
+// 回归模型在 Landsat 分辨率下拟合。
+var REGRESSION_SCALE = 30;
+
+// [需要修改：导出路径]
+// 这里是 Export.image 使用的 Google Drive 文件夹。
+var EXPORT_FOLDER = 'GEE_LST_huantai';
+
+// 导出坐标系。EPSG:4326 便于共享；如果后续需要做面积或距离等度量分析，
+// 建议改用合适的投影坐标系。
+var EXPORT_CRS = 'EPSG:4326';
+var MAX_PIXELS = 1e13;
+
+// [需要根据研究区调试：TVDI 参数]
+// TVDI 公式：TVDI = (LST - LSTwet) / (LSTdry - LSTwet)。
+// 这里按 NDVI 分箱，在每个分箱内用 LST 低分位数作为湿边点、高分位数作为干边点。
+// 使用分位数而不是绝对最小/最大值，可以减少异常像元对边界拟合的影响。
+var TVDI_NDVI_MIN = 0.05;
+var TVDI_NDVI_MAX = 0.90;
+var TVDI_NDVI_BIN_WIDTH = 0.05;
+var TVDI_WET_PERCENTILE = 5;
+var TVDI_DRY_PERCENTILE = 95;
+var TVDI_MIN_PIXELS_PER_BIN = 30;
+
+// TVDI 有效像元筛选。水体和异常温度会明显拉歪干湿边，必要时按本地情况调整。
+var TVDI_LST_MIN = -20;
+var TVDI_LST_MAX = 60;
+var TVDI_NDWI_WATER_MAX = 0.30;
+var TVDI_MIN_EDGE_GAP_C = 0.5;
+
+// Landsat 回归和 Sentinel-2 应用中共同使用的预测变量。
+// BLUE/GREEN/RED/NIR 在 Sentinel-2 中是原生 10 m 波段。SWIR1 对应 Sentinel-2 B11，
+// 原生分辨率为 20 m，因此在 10 m 导出时 GEE 会进行重采样。NDBI 需要 SWIR1；
+// 如果只想使用 Sentinel-2 原生 10 m 波段，可从列表中移除 SWIR1 和 NDBI。
+var PREDICTOR_BANDS = [
+  'BLUE',
+  'GREEN',
+  'RED',
+  'NIR',
+  'SWIR1',
+  'NDVI',
+  'NDWI',
+  'NDBI'
+];
+
+/*******************************************************************************
+ * 2. 辅助函数。
+ ******************************************************************************/
+
+// 对 Landsat Collection 2 Level-2 数据中的云、云影、卷云、积雪和饱和像元进行掩膜，
+// 然后缩放光学反射率和热红外 LST。
+function maskAndScaleLandsatC2L2(image) {
+  var qa = image.select('QA_PIXEL');
+
+  var clearMask = qa.bitwiseAnd(1 << 0).eq(0)  // 填充值
+    .and(qa.bitwiseAnd(1 << 1).eq(0))          // 膨胀云
+    .and(qa.bitwiseAnd(1 << 2).eq(0))          // 卷云
+    .and(qa.bitwiseAnd(1 << 3).eq(0))          // 云
+    .and(qa.bitwiseAnd(1 << 4).eq(0))          // 云影
+    .and(qa.bitwiseAnd(1 << 5).eq(0));         // 雪
+
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  var optical = image.select('SR_B.')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  // Landsat Collection 2 ST_B10 缩放系数：
+  // 开尔文温度 = DN * 0.00341802 + 149.0；摄氏度 = 开尔文温度 - 273.15。
+  var lstCelsius = image.select('ST_B10')
+    .multiply(0.00341802)
+    .add(149.0)
+    .subtract(273.15)
+    .rename('LST');
+
+  return ee.Image(image.addBands(optical, null, true)
+    .addBands(lstCelsius, null, true)
+    .updateMask(clearMask)
+    .updateMask(saturationMask)
+    .copyProperties(image, ['system:time_start', 'SPACECRAFT_ID']));
+}
+
+// 更稳妥的归一化差值计算。ee.Image.normalizedDifference 在输入值为负时可能掩膜像元；
+// Landsat C2 缩放后的反射率可能包含少量负值，所以这里显式写公式更合适。
+function normalizedDifferenceSafe(image, highBand, lowBand, outputName) {
+  return image.expression(
+    '(high - low) / (high + low)',
+    {
+      high: image.select(highBand),
+      low: image.select(lowBand)
+    }
+  ).rename(outputName);
+}
+
+// 构建 Landsat 预测变量。波段含义：
+// BLUE: SR_B2，GREEN: SR_B3，RED: SR_B4，NIR: SR_B5，SWIR1: SR_B6。
+function addLandsatPredictors(image) {
+  var blue = image.select('SR_B2').rename('BLUE');
+  var green = image.select('SR_B3').rename('GREEN');
+  var red = image.select('SR_B4').rename('RED');
+  var nir = image.select('SR_B5').rename('NIR');
+  var swir1 = image.select('SR_B6').rename('SWIR1');
+
+  var ndvi = normalizedDifferenceSafe(image, 'SR_B5', 'SR_B4', 'NDVI');
+  var ndwi = normalizedDifferenceSafe(image, 'SR_B3', 'SR_B5', 'NDWI');
+  var ndbi = normalizedDifferenceSafe(image, 'SR_B6', 'SR_B5', 'NDBI');
+
+  return ee.Image(ee.Image.cat([
+      blue, green, red, nir, swir1, ndvi, ndwi, ndbi, image.select('LST')
+    ])
+    .copyProperties(image, ['system:time_start', 'SPACECRAFT_ID']));
+}
+
+// 使用 SCL 波段掩膜 Sentinel-2 L2A Harmonized 数据中的云和云影。
+function maskAndScaleSentinel2(image) {
+  image = ee.Image(image);
+  var scl = image.select('SCL');
+
+  var clearMask = scl.neq(0)   // 无数据
+    .and(scl.neq(1))           // 饱和或异常像元
+    .and(scl.neq(3))           // 云影
+    .and(scl.neq(8))           // 中概率云
+    .and(scl.neq(9))           // 高概率云
+    .and(scl.neq(10))          // 薄卷云
+    .and(scl.neq(11));         // 雪或冰
+
+  var scaled = image.select(['B2', 'B3', 'B4', 'B8', 'B11'])
+    .multiply(0.0001);
+
+  return ee.Image(image.addBands(scaled, null, true)
+    .updateMask(clearMask)
+    .copyProperties(image, ['system:time_start']));
+}
+
+// 构建 Sentinel-2 预测变量，并让名称与 Landsat 预测变量保持一致。
+// B2/B3/B4/B8 是原生 10 m 波段。B11 是原生 20 m 波段，在 10 m 导出时由 GEE 重采样。
+function addSentinel2Predictors(image) {
+  image = ee.Image(image);
+  var blue = image.select('B2').rename('BLUE');
+  var green = image.select('B3').rename('GREEN');
+  var red = image.select('B4').rename('RED');
+  var nir = image.select('B8').rename('NIR');
+  var swir1 = image.select('B11').resample('bicubic').rename('SWIR1');
+
+  var ndvi = normalizedDifferenceSafe(image, 'B8', 'B4', 'NDVI');
+  var ndwi = normalizedDifferenceSafe(image, 'B3', 'B8', 'NDWI');
+  var ndbi = normalizedDifferenceSafe(image, 'B11', 'B8', 'NDBI');
+
+  return ee.Image(ee.Image.cat([blue, green, red, nir, swir1, ndvi, ndwi, ndbi])
+    .copyProperties(image, ['system:time_start']));
+}
+
+/*******************************************************************************
+ * 3. 批量筛选符合要求的 Sentinel-2 影像。
+ ******************************************************************************/
+
+// 避免 Map.centerObject 对资产几何发起额外的 value:compute 请求。
+// 桓台县附近中心点：118.1E, 36.95N。
+Map.setCenter(118.1, 36.95, 9);
+Map.addLayer(roi, {color: 'yellow'}, 'Huantai ROI', false);
+
+var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+var landsat9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2');
+
+var rawLandsatCollection = landsat8.merge(landsat9)
+  .filterBounds(roi)
+  .filter(ee.Filter.lte('CLOUD_COVER', LANDSAT_CLOUD_MAX));
+
+var rawSentinel2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(BATCH_START_DATE, BATCH_END_DATE)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', SENTINEL2_CLOUD_MAX));
+
+function annotateSentinel2ForExport(image) {
+  var targetDate = ee.Date(image.get('system:time_start'));
+  var landsatWindowStart = targetDate.advance(-LANDSAT_WINDOW_DAYS, 'day');
+  var landsatWindowEnd = targetDate.advance(LANDSAT_WINDOW_DAYS + 1, 'day');
+  var landsatCount = rawLandsatCollection
+    .filterDate(landsatWindowStart, landsatWindowEnd)
+    .size();
+
+  return image.set({
+    image_id: image.id(),
+    system_index: image.get('system:index'),
+    date: targetDate.format('YYYY-MM-dd'),
+    date_tag: targetDate.format('YYYYMMdd'),
+    mgrs_tile: image.get('MGRS_TILE'),
+    sentinel2_cloud: image.get('CLOUDY_PIXEL_PERCENTAGE'),
+    landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
+    landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd'),
+    landsat_count: landsatCount
+  });
+}
+
+var annotatedSentinel2Collection = rawSentinel2Collection
+  .map(annotateSentinel2ForExport);
+
+// 每天只保留一景：先按 Sentinel-2 云量从低到高排序，再按 date 去重。
+// 如果同一天有多个瓦片覆盖研究区，会选择整景云量最低的那一景。
+var exportSentinel2Collection = annotatedSentinel2Collection
+  .filter(ee.Filter.gte('landsat_count', MIN_LANDSAT_IMAGES_FOR_DATE))
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .distinct('date')
+  .sort('date_tag');
+
+var exportCandidateTable = ee.FeatureCollection(
+  exportSentinel2Collection
+    .toList(exportSentinel2Collection.size())
+    .map(function(image) {
+      image = ee.Image(image);
+      return ee.Feature(null, image.toDictionary([
+        'image_id',
+        'system_index',
+        'date',
+        'date_tag',
+        'mgrs_tile',
+        'sentinel2_cloud',
+        'landsat_window_start',
+        'landsat_window_end_exclusive',
+        'landsat_count'
+      ]));
+    })
+);
+
+print('Study area asset:', ROI_ASSET);
+print('Batch date range:', BATCH_START_DATE, 'to', BATCH_END_DATE, '(BATCH_END_DATE is exclusive)');
+print('Raw Sentinel-2 image count in date range:', rawSentinel2Collection.size());
+print('Daily export candidate count:', exportSentinel2Collection.size());
+print('Daily export candidates preview, first 50:', exportCandidateTable.limit(50));
+
+/*******************************************************************************
+ * 4. 对单景 Sentinel-2 影像计算 10 m LST 和 TVDI。
+ ******************************************************************************/
+
+function buildLSTTVDIProducts(targetDateString, sentinel2RawImage) {
+  sentinel2RawImage = ee.Image(sentinel2RawImage);
+  var targetDate = ee.Date(targetDateString);
+  var landsatWindowStart = targetDate.advance(-LANDSAT_WINDOW_DAYS, 'day');
+  var landsatWindowEnd = targetDate.advance(LANDSAT_WINDOW_DAYS + 1, 'day');
+
+  var landsatCollection = rawLandsatCollection
+    .filterDate(landsatWindowStart, landsatWindowEnd)
+    .map(maskAndScaleLandsatC2L2)
+    .map(addLandsatPredictors)
+    .select(PREDICTOR_BANDS.concat(['LST']));
+
+  var sentinel2Masked = maskAndScaleSentinel2(sentinel2RawImage);
+  var sentinel2Predictors = addSentinel2Predictors(sentinel2Masked);
+  var sentinel2Image = ee.Image(sentinel2Predictors)
+    .select(PREDICTOR_BANDS)
+    .clip(roi);
+
+  var landsatComposite = landsatCollection.median().clip(roi);
+  var coefficientNames = ['intercept'].concat(PREDICTOR_BANDS);
+
+  var landsatConstant = ee.Image.constant(1)
+    .rename('intercept')
+    .setDefaultProjection(landsatComposite.select('BLUE').projection());
+
+  var regressionInputs = landsatConstant
+    .addBands(landsatComposite.select(PREDICTOR_BANDS))
+    .addBands(landsatComposite.select('LST'));
+
+  var regression = regressionInputs.reduceRegion({
+    reducer: ee.Reducer.linearRegression({
+      numX: PREDICTOR_BANDS.length + 1,
+      numY: 1
+    }),
+    geometry: roi,
+    scale: REGRESSION_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: 4
+  });
+
+  var coefficients = ee.Array(regression.get('coefficients')).project([0]);
+  var coefficientImage = ee.Image.constant(coefficients.toList())
+    .rename(coefficientNames);
+
+  var landsatModelInputs = landsatConstant
+    .addBands(landsatComposite.select(PREDICTOR_BANDS));
+
+  var landsatPredicted30m = landsatModelInputs
+    .multiply(coefficientImage)
+    .reduce(ee.Reducer.sum())
+    .rename('LST_model_30m')
+    .clip(roi);
+
+  var landsatResiduals30m = landsatComposite.select('LST')
+    .subtract(landsatPredicted30m)
+    .rename('LST_residual_30m')
+    .clip(roi);
+
+  var gaussianKernel = ee.Kernel.gaussian({
+    radius: 1.5,
+    sigma: 1,
+    units: 'pixels',
+    normalize: true
+  });
+
+  var landsatResiduals10m = landsatResiduals30m
+    .resample('bicubic')
+    .convolve(gaussianKernel)
+    .rename('LST_residual_10m');
+
+  var sentinel2Constant = ee.Image.constant(1)
+    .rename('intercept')
+    .setDefaultProjection(sentinel2Image.select('BLUE').projection());
+
+  var sentinel2ModelInputs = sentinel2Constant
+    .addBands(sentinel2Image.select(PREDICTOR_BANDS));
+
+  var lst10mNoResiduals = sentinel2ModelInputs
+    .multiply(coefficientImage)
+    .reduce(ee.Reducer.sum())
+    .rename('LST_10m_no_residuals')
+    .clip(roi);
+
+  var lst10mWithResiduals = ee.Image(lst10mNoResiduals
+    .add(landsatResiduals10m)
+    .rename('LST_10m_C')
+    .clip(roi)
+    .set({
+      target_date: targetDate.format('YYYY-MM-dd'),
+      landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
+      landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd')
+    })
+    .copyProperties(sentinel2RawImage, ['system:time_start', 'system:index', 'MGRS_TILE']));
+
+  var tvdiNdvi = sentinel2Image.select('NDVI').rename('NDVI');
+  var tvdiNdwi = sentinel2Image.select('NDWI').rename('NDWI');
+  var tvdiLst = lst10mWithResiduals.rename('LST');
+
+  var tvdiValidMask = tvdiNdvi.gte(TVDI_NDVI_MIN)
+    .and(tvdiNdvi.lte(TVDI_NDVI_MAX))
+    .and(tvdiLst.gte(TVDI_LST_MIN))
+    .and(tvdiLst.lte(TVDI_LST_MAX))
+    .and(tvdiNdwi.lt(TVDI_NDWI_WATER_MAX));
+
+  var tvdiBinStarts = ee.List.sequence(
+    TVDI_NDVI_MIN,
+    ee.Number(TVDI_NDVI_MAX).subtract(TVDI_NDVI_BIN_WIDTH),
+    TVDI_NDVI_BIN_WIDTH
+  );
+
+  var tvdiEdgeSamples = ee.FeatureCollection(tvdiBinStarts.map(function(binStart) {
+    binStart = ee.Number(binStart);
+    var binEnd = binStart.add(TVDI_NDVI_BIN_WIDTH);
+    var binMask = tvdiNdvi.gte(binStart).and(tvdiNdvi.lt(binEnd));
+    var binLst = tvdiLst.updateMask(tvdiValidMask).updateMask(binMask);
+
+    var edgePercentiles = binLst.reduceRegion({
+      reducer: ee.Reducer.percentile(
+        [TVDI_WET_PERCENTILE, TVDI_DRY_PERCENTILE],
+        ['wet', 'dry']
+      ),
+      geometry: roi,
+      scale: OUTPUT_SCALE,
+      maxPixels: MAX_PIXELS,
+      tileScale: 4
+    });
+
+    var binCount = binLst.reduceRegion({
+      reducer: ee.Reducer.count(),
+      geometry: roi,
+      scale: OUTPUT_SCALE,
+      maxPixels: MAX_PIXELS,
+      tileScale: 4
+    });
+
+    return ee.Feature(null, {
+      ndvi_mid: binStart.add(binEnd).divide(2),
+      lst_wet: edgePercentiles.get('LST_wet'),
+      lst_dry: edgePercentiles.get('LST_dry'),
+      pixel_count: binCount.get('LST')
+    });
+  }))
+    .filter(ee.Filter.notNull(['lst_wet', 'lst_dry', 'pixel_count']))
+    .filter(ee.Filter.gte('pixel_count', TVDI_MIN_PIXELS_PER_BIN));
+
+  var tvdiWetFit = tvdiEdgeSamples.reduceColumns(
+    ee.Reducer.linearFit(),
+    ['ndvi_mid', 'lst_wet']
+  );
+  var tvdiDryFit = tvdiEdgeSamples.reduceColumns(
+    ee.Reducer.linearFit(),
+    ['ndvi_mid', 'lst_dry']
+  );
+
+  var wetSlope = ee.Number(tvdiWetFit.get('scale'));
+  var wetIntercept = ee.Number(tvdiWetFit.get('offset'));
+  var drySlope = ee.Number(tvdiDryFit.get('scale'));
+  var dryIntercept = ee.Number(tvdiDryFit.get('offset'));
+
+  var lstWetEdge = tvdiNdvi.multiply(wetSlope)
+    .add(wetIntercept)
+    .rename('LST_wet_edge');
+  var lstDryEdge = tvdiNdvi.multiply(drySlope)
+    .add(dryIntercept)
+    .rename('LST_dry_edge');
+  var tvdiEdgeGap = lstDryEdge.subtract(lstWetEdge).rename('LST_edge_gap');
+
+  var tvdi = ee.Image(tvdiLst.subtract(lstWetEdge)
+    .divide(tvdiEdgeGap)
+    .rename('TVDI')
+    .updateMask(tvdiValidMask)
+    .updateMask(tvdiEdgeGap.gt(TVDI_MIN_EDGE_GAP_C))
+    .clamp(0, 1)
+    .clip(roi)
+    .set({
+      target_date: targetDate.format('YYYY-MM-dd'),
+      landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
+      landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd')
+    })
+    .copyProperties(sentinel2RawImage, ['system:time_start', 'system:index', 'MGRS_TILE']));
+
+  return {
+    lst10mWithResiduals: lst10mWithResiduals,
+    tvdi: tvdi,
+    sentinel2Image: sentinel2Image,
+    landsatCollection: landsatCollection,
+    tvdiEdgeSamples: tvdiEdgeSamples
+  };
+}
+
+/*******************************************************************************
+ * 5. 显示样式。
+ ******************************************************************************/
+
+var lstVis = {
+  min: 0,
+  max: 35,
+  palette: [
+    '040274', '235cb1', '307ef3', '30c8e2',
+    'fff705', 'ffd611', 'ff8b13', 'ff500d',
+    'ff0000', 'a71001'
+  ]
+};
+
+var tvdiVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    '2166ac', '67a9cf', 'd1e5f0', 'f7f7f7',
+    'fddbc7', 'ef8a62', 'b2182b'
+  ]
+};
+
+/*******************************************************************************
+ * 6. 批量创建导出任务。
+ ******************************************************************************/
+
+function sanitizeExportText(value) {
+  return String(value || 'unknown').replace(/[^0-9A-Za-z_]+/g, '_');
+}
+
+function makeExportSuffix(props, index) {
+  var dateTag = sanitizeExportText(props.date_tag || String(props.date || '').replace(/-/g, ''));
+  var tile = sanitizeExportText(props.mgrs_tile || 'tile');
+  var sequence = ('000' + (index + 1)).slice(-3);
+  return dateTag + '_' + tile + '_' + sequence;
+}
+
+function getSentinel2RawImage(props) {
+  return ee.Image(rawSentinel2Collection
+    .filter(ee.Filter.eq('system:index', props.system_index))
+    .first());
+}
+
+function createExportTasks(props, index) {
+  var suffix = makeExportSuffix(props, index);
+  var products = buildLSTTVDIProducts(props.date, getSentinel2RawImage(props));
+
+  Export.image.toDrive({
+    image: products.lst10mWithResiduals,
+    description: 'huantai_LST_10m_' + suffix,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'huantai_LST_10m_' + suffix,
+    region: roi,
+    scale: OUTPUT_SCALE,
+    crs: EXPORT_CRS,
+    maxPixels: MAX_PIXELS,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+      cloudOptimized: true
+    }
+  });
+
+  Export.image.toDrive({
+    image: products.tvdi,
+    description: 'huantai_TVDI_10m_' + suffix,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'huantai_TVDI_10m_' + suffix,
+    region: roi,
+    scale: OUTPUT_SCALE,
+    crs: EXPORT_CRS,
+    maxPixels: MAX_PIXELS,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+      cloudOptimized: true
+    }
+  });
+}
+
+// Code Editor 的导出任务必须在客户端创建；因此先 evaluate 影像清单，
+// 再逐景创建 LST 和 TVDI 导出任务。任务创建后仍需到 Tasks 面板启动。
+exportCandidateTable.evaluate(function(candidateTable) {
+  if (!candidateTable || !candidateTable.features || candidateTable.features.length === 0) {
+    print('No export candidates found. Please loosen cloud thresholds or date range.');
+    return;
+  }
+
+  print('Creating LST/TVDI export tasks:', candidateTable.features.length);
+  var previewProps = candidateTable.features[0].properties;
+  var previewProducts = buildLSTTVDIProducts(previewProps.date, getSentinel2RawImage(previewProps));
+
+  Map.addLayer(
+    previewProducts.sentinel2Image,
+    {bands: ['RED', 'GREEN', 'BLUE'], min: 0.02, max: 0.3},
+    'Preview Sentinel-2 RGB first candidate',
+    false
+  );
+  Map.addLayer(
+    previewProducts.lst10mWithResiduals,
+    lstVis,
+    'Preview LST 10 m first candidate',
+    true
+  );
+  Map.addLayer(
+    previewProducts.tvdi,
+    tvdiVis,
+    'Preview TVDI 10 m first candidate',
+    false
+  );
+
+  candidateTable.features.forEach(function(feature, index) {
+    createExportTasks(feature.properties, index);
+  });
+});
