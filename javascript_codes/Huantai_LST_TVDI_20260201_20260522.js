@@ -23,16 +23,11 @@ var ROI_ASSET = 'projects/python-478207/assets/huantai';
 var roiFc = ee.FeatureCollection(ROI_ASSET);
 var roi = roiFc.geometry();
 
-// [需要修改：批量导出时间范围]
-// GEE 的 filterDate 包含 BATCH_START_DATE，但不包含 BATCH_END_DATE。
+// [需要修改：时间范围]
+// GEE 的 filterDate 包含 START_DATE，但不包含 END_DATE。
 // 这里设置为 2026-02-01 至 2026-05-22；为包含 2026-05-22，结束日期写作 2026-05-23。
-var BATCH_START_DATE = '2026-02-01';
-var BATCH_END_DATE = '2026-05-23';
-
-// 对每一景符合条件的 Sentinel-2 影像，使用其成像日前后若干天的 Landsat 8/9
-// 数据拟合 LST 回归模型。7 表示 [-7, +7] 天窗口。
-var LANDSAT_WINDOW_DAYS = 7;
-var MIN_LANDSAT_IMAGES_FOR_DATE = 1;
+var START_DATE = '2026-02-01';
+var END_DATE = '2026-05-23';
 
 // [需要修改：云量阈值]
 // Landsat 使用 CLOUD_COVER 字段；Sentinel-2 使用 CLOUDY_PIXEL_PERCENTAGE 字段。
@@ -47,8 +42,17 @@ var OUTPUT_SCALE = 10;
 var REGRESSION_SCALE = 30;
 
 // [需要修改：导出路径]
-// 这里是 Export.image 使用的 Google Drive 文件夹。
+// 这里是 Export.image 使用的 Google Drive 文件夹和输出文件名前缀。
 var EXPORT_FOLDER = 'GEE_LST_huantai';
+var TVDI_EXPORT_PREFIX = 'huantai_TVDI_10m';
+
+// [需要修改：自适应窗口覆盖判定]
+// 1.0 表示严格要求覆盖率为 100%。考虑 ROI 边界、掩膜和重采样误差，
+// 默认使用 0.99；如果需要更严格，可改成 0.995 或 1.0。
+var COVERAGE_THRESHOLD = 0.99;
+var COVERAGE_CHECK_SCALE = 30;
+var MIN_SENTINEL2_IMAGES_FOR_WINDOW = 1;
+var MIN_LANDSAT_IMAGES_FOR_WINDOW = 1;
 
 // 导出坐标系。EPSG:4326 便于共享；如果后续需要做面积或距离等度量分析，
 // 建议改用合适的投影坐标系。
@@ -195,7 +199,7 @@ function addSentinel2Predictors(image) {
 }
 
 /*******************************************************************************
- * 3. 批量筛选符合要求的 Sentinel-2 影像。
+ * 3. 自适应时间窗口扫描。
  ******************************************************************************/
 
 // 避免 Map.centerObject 对资产几何发起额外的 value:compute 请求。
@@ -212,89 +216,124 @@ var rawLandsatCollection = landsat8.merge(landsat9)
 
 var rawSentinel2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(roi)
-  .filterDate(BATCH_START_DATE, BATCH_END_DATE)
   .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', SENTINEL2_CLOUD_MAX));
 
-function annotateSentinel2ForExport(image) {
-  var targetDate = ee.Date(image.get('system:time_start'));
-  var landsatWindowStart = targetDate.advance(-LANDSAT_WINDOW_DAYS, 'day');
-  var landsatWindowEnd = targetDate.advance(LANDSAT_WINDOW_DAYS + 1, 'day');
+print('Study area asset:', ROI_ASSET);
+print('Adaptive date range:', START_DATE, 'to', END_DATE, '(END_DATE is exclusive)');
+print('Coverage threshold:', COVERAGE_THRESHOLD);
+
+function pad2(value) {
+  return value < 10 ? '0' + value : String(value);
+}
+
+function parseDateUtc(dateString) {
+  var parts = dateString.split('-');
+  return new Date(Date.UTC(
+    Number(parts[0]),
+    Number(parts[1]) - 1,
+    Number(parts[2])
+  ));
+}
+
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function formatDateIso(date) {
+  return date.getUTCFullYear() + '-' +
+    pad2(date.getUTCMonth() + 1) + '-' +
+    pad2(date.getUTCDate());
+}
+
+function formatDateTag(date) {
+  return date.getUTCFullYear() +
+    pad2(date.getUTCMonth() + 1) +
+    pad2(date.getUTCDate());
+}
+
+var startDateClient = parseDateUtc(START_DATE);
+var endDateExclusiveClient = parseDateUtc(END_DATE);
+var exportedWindowCount = 0;
+
+function getWindowCounts(windowStart, windowEndExclusive) {
   var landsatCount = rawLandsatCollection
-    .filterDate(landsatWindowStart, landsatWindowEnd)
+    .filterDate(windowStart, windowEndExclusive)
+    .size();
+  var sentinel2Count = rawSentinel2Collection
+    .filterDate(windowStart, windowEndExclusive)
     .size();
 
-  return image.set({
-    image_id: image.id(),
-    system_index: image.get('system:index'),
-    date: targetDate.format('YYYY-MM-dd'),
-    date_tag: targetDate.format('YYYYMMdd'),
-    mgrs_tile: image.get('MGRS_TILE'),
-    sentinel2_cloud: image.get('CLOUDY_PIXEL_PERCENTAGE'),
-    landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
-    landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd'),
-    landsat_count: landsatCount
+  return ee.Dictionary({
+    landsat_count: landsatCount,
+    sentinel2_count: sentinel2Count
   });
 }
 
-var annotatedSentinel2Collection = rawSentinel2Collection
-  .map(annotateSentinel2ForExport);
+function buildSentinel2Composite(windowStart, windowEndExclusive) {
+  var sentinel2Collection = rawSentinel2Collection
+    .filterDate(windowStart, windowEndExclusive)
+    .map(maskAndScaleSentinel2)
+    .map(addSentinel2Predictors)
+    .select(PREDICTOR_BANDS);
 
-// 每天只保留一景：先按 Sentinel-2 云量从低到高排序，再按 date 去重。
-// 如果同一天有多个瓦片覆盖研究区，会选择整景云量最低的那一景。
-var exportSentinel2Collection = annotatedSentinel2Collection
-  .filter(ee.Filter.gte('landsat_count', MIN_LANDSAT_IMAGES_FOR_DATE))
-  .sort('CLOUDY_PIXEL_PERCENTAGE')
-  .distinct('date')
-  .sort('date_tag');
+  return ee.Image(sentinel2Collection.median())
+    .select(PREDICTOR_BANDS)
+    .clip(roi);
+}
 
-var exportCandidateTable = ee.FeatureCollection(
-  exportSentinel2Collection
-    .toList(exportSentinel2Collection.size())
-    .map(function(image) {
-      image = ee.Image(image);
-      return ee.Feature(null, image.toDictionary([
-        'image_id',
-        'system_index',
-        'date',
-        'date_tag',
-        'mgrs_tile',
-        'sentinel2_cloud',
-        'landsat_window_start',
-        'landsat_window_end_exclusive',
-        'landsat_count'
-      ]));
-    })
-);
+function getSentinel2Coverage(windowStart, windowEndExclusive) {
+  var sentinel2Composite = buildSentinel2Composite(windowStart, windowEndExclusive);
+  var validMask = sentinel2Composite.select(['NDVI', 'NDWI'])
+    .mask()
+    .reduce(ee.Reducer.min())
+    .rename('valid');
 
-print('Study area asset:', ROI_ASSET);
-print('Batch date range:', BATCH_START_DATE, 'to', BATCH_END_DATE, '(BATCH_END_DATE is exclusive)');
-print('Raw Sentinel-2 image count in date range:', rawSentinel2Collection.size());
-print('Daily export candidate count:', exportSentinel2Collection.size());
-print('Daily export candidates preview, first 50:', exportCandidateTable.limit(50));
+  var pixelArea = ee.Image.pixelArea().rename('area');
+  var totalAreaValue = pixelArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: COVERAGE_CHECK_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: 4
+  }).get('area');
+
+  var validAreaValue = pixelArea.updateMask(validMask).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: COVERAGE_CHECK_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: 4
+  }).get('area');
+
+  var totalArea = ee.Number(totalAreaValue);
+  var validArea = ee.Number(ee.Algorithms.If(validAreaValue, validAreaValue, 0));
+
+  return ee.Dictionary({
+    coverage_ratio: validArea.divide(totalArea),
+    valid_area_m2: validArea,
+    total_area_m2: totalArea
+  });
+}
 
 /*******************************************************************************
- * 4. 对单景 Sentinel-2 影像计算 10 m LST 和 TVDI。
+ * 4. 对一个已满足覆盖条件的时间窗口计算 TVDI。
  ******************************************************************************/
 
-function buildLSTTVDIProducts(targetDateString, sentinel2RawImage) {
-  sentinel2RawImage = ee.Image(sentinel2RawImage);
-  var targetDate = ee.Date(targetDateString);
-  var landsatWindowStart = targetDate.advance(-LANDSAT_WINDOW_DAYS, 'day');
-  var landsatWindowEnd = targetDate.advance(LANDSAT_WINDOW_DAYS + 1, 'day');
-
+function buildWindowTVDI(windowStart, windowEndExclusive) {
   var landsatCollection = rawLandsatCollection
-    .filterDate(landsatWindowStart, landsatWindowEnd)
+    .filterDate(windowStart, windowEndExclusive)
     .map(maskAndScaleLandsatC2L2)
     .map(addLandsatPredictors)
     .select(PREDICTOR_BANDS.concat(['LST']));
 
-  var sentinel2Masked = maskAndScaleSentinel2(sentinel2RawImage);
-  var sentinel2Predictors = addSentinel2Predictors(sentinel2Masked);
-  var sentinel2Image = ee.Image(sentinel2Predictors)
-    .select(PREDICTOR_BANDS)
-    .clip(roi);
+  var sentinel2Collection = rawSentinel2Collection
+    .filterDate(windowStart, windowEndExclusive)
+    .map(maskAndScaleSentinel2)
+    .map(addSentinel2Predictors)
+    .select(PREDICTOR_BANDS);
 
   var landsatComposite = landsatCollection.median().clip(roi);
+  var sentinel2Composite = sentinel2Collection.median().clip(roi);
   var coefficientNames = ['intercept'].concat(PREDICTOR_BANDS);
 
   var landsatConstant = ee.Image.constant(1)
@@ -348,10 +387,10 @@ function buildLSTTVDIProducts(targetDateString, sentinel2RawImage) {
 
   var sentinel2Constant = ee.Image.constant(1)
     .rename('intercept')
-    .setDefaultProjection(sentinel2Image.select('BLUE').projection());
+    .setDefaultProjection(sentinel2Composite.select('BLUE').projection());
 
   var sentinel2ModelInputs = sentinel2Constant
-    .addBands(sentinel2Image.select(PREDICTOR_BANDS));
+    .addBands(sentinel2Composite.select(PREDICTOR_BANDS));
 
   var lst10mNoResiduals = sentinel2ModelInputs
     .multiply(coefficientImage)
@@ -359,19 +398,13 @@ function buildLSTTVDIProducts(targetDateString, sentinel2RawImage) {
     .rename('LST_10m_no_residuals')
     .clip(roi);
 
-  var lst10mWithResiduals = ee.Image(lst10mNoResiduals
+  var lst10mWithResiduals = lst10mNoResiduals
     .add(landsatResiduals10m)
     .rename('LST_10m_C')
-    .clip(roi)
-    .set({
-      target_date: targetDate.format('YYYY-MM-dd'),
-      landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
-      landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd')
-    })
-    .copyProperties(sentinel2RawImage, ['system:time_start', 'system:index', 'MGRS_TILE']));
+    .clip(roi);
 
-  var tvdiNdvi = sentinel2Image.select('NDVI').rename('NDVI');
-  var tvdiNdwi = sentinel2Image.select('NDWI').rename('NDWI');
+  var tvdiNdvi = sentinel2Composite.select('NDVI').rename('NDVI');
+  var tvdiNdwi = sentinel2Composite.select('NDWI').rename('NDWI');
   var tvdiLst = lst10mWithResiduals.rename('LST');
 
   var tvdiValidMask = tvdiNdvi.gte(TVDI_NDVI_MIN)
@@ -443,42 +476,18 @@ function buildLSTTVDIProducts(targetDateString, sentinel2RawImage) {
     .rename('LST_dry_edge');
   var tvdiEdgeGap = lstDryEdge.subtract(lstWetEdge).rename('LST_edge_gap');
 
-  var tvdi = ee.Image(tvdiLst.subtract(lstWetEdge)
+  return tvdiLst.subtract(lstWetEdge)
     .divide(tvdiEdgeGap)
     .rename('TVDI')
     .updateMask(tvdiValidMask)
     .updateMask(tvdiEdgeGap.gt(TVDI_MIN_EDGE_GAP_C))
     .clamp(0, 1)
-    .clip(roi)
-    .set({
-      target_date: targetDate.format('YYYY-MM-dd'),
-      landsat_window_start: landsatWindowStart.format('YYYY-MM-dd'),
-      landsat_window_end_exclusive: landsatWindowEnd.format('YYYY-MM-dd')
-    })
-    .copyProperties(sentinel2RawImage, ['system:time_start', 'system:index', 'MGRS_TILE']));
-
-  return {
-    lst10mWithResiduals: lst10mWithResiduals,
-    tvdi: tvdi,
-    sentinel2Image: sentinel2Image,
-    landsatCollection: landsatCollection,
-    tvdiEdgeSamples: tvdiEdgeSamples
-  };
+    .clip(roi);
 }
 
 /*******************************************************************************
- * 5. 显示样式。
+ * 5. 创建导出任务并按时间顺序继续扫描。
  ******************************************************************************/
-
-var lstVis = {
-  min: 0,
-  max: 35,
-  palette: [
-    '040274', '235cb1', '307ef3', '30c8e2',
-    'fff705', 'ffd611', 'ff8b13', 'ff500d',
-    'ff0000', 'a71001'
-  ]
-};
 
 var tvdiVis = {
   min: 0,
@@ -489,36 +498,25 @@ var tvdiVis = {
   ]
 };
 
-/*******************************************************************************
- * 6. 批量创建导出任务。
- ******************************************************************************/
+function createTVDIExport(windowStartDate, windowEndExclusiveDate, diagnostics) {
+  var windowStart = formatDateIso(windowStartDate);
+  var windowEndExclusive = formatDateIso(windowEndExclusiveDate);
+  var windowEndInclusiveDate = addDays(windowEndExclusiveDate, -1);
+  var suffix = formatDateTag(windowStartDate) + '_' + formatDateTag(windowEndInclusiveDate);
+  var exportName = TVDI_EXPORT_PREFIX + '_' + suffix;
+  var tvdi = buildWindowTVDI(windowStart, windowEndExclusive);
 
-function sanitizeExportText(value) {
-  return String(value || 'unknown').replace(/[^0-9A-Za-z_]+/g, '_');
-}
+  print('Create TVDI export:', exportName, diagnostics);
 
-function makeExportSuffix(props, index) {
-  var dateTag = sanitizeExportText(props.date_tag || String(props.date || '').replace(/-/g, ''));
-  var tile = sanitizeExportText(props.mgrs_tile || 'tile');
-  var sequence = ('000' + (index + 1)).slice(-3);
-  return dateTag + '_' + tile + '_' + sequence;
-}
-
-function getSentinel2RawImage(props) {
-  return ee.Image(rawSentinel2Collection
-    .filter(ee.Filter.eq('system:index', props.system_index))
-    .first());
-}
-
-function createExportTasks(props, index) {
-  var suffix = makeExportSuffix(props, index);
-  var products = buildLSTTVDIProducts(props.date, getSentinel2RawImage(props));
+  if (exportedWindowCount === 0) {
+    Map.addLayer(tvdi, tvdiVis, 'Preview ' + exportName, true);
+  }
 
   Export.image.toDrive({
-    image: products.lst10mWithResiduals,
-    description: 'huantai_LST_10m_' + suffix,
+    image: tvdi,
+    description: exportName,
     folder: EXPORT_FOLDER,
-    fileNamePrefix: 'huantai_LST_10m_' + suffix,
+    fileNamePrefix: exportName,
     region: roi,
     scale: OUTPUT_SCALE,
     crs: EXPORT_CRS,
@@ -529,54 +527,72 @@ function createExportTasks(props, index) {
     }
   });
 
-  Export.image.toDrive({
-    image: products.tvdi,
-    description: 'huantai_TVDI_10m_' + suffix,
-    folder: EXPORT_FOLDER,
-    fileNamePrefix: 'huantai_TVDI_10m_' + suffix,
-    region: roi,
-    scale: OUTPUT_SCALE,
-    crs: EXPORT_CRS,
-    maxPixels: MAX_PIXELS,
-    fileFormat: 'GeoTIFF',
-    formatOptions: {
-      cloudOptimized: true
-    }
-  });
+  exportedWindowCount += 1;
 }
 
-// Code Editor 的导出任务必须在客户端创建；因此先 evaluate 影像清单，
-// 再逐景创建 LST 和 TVDI 导出任务。任务创建后仍需到 Tasks 面板启动。
-exportCandidateTable.evaluate(function(candidateTable) {
-  if (!candidateTable || !candidateTable.features || candidateTable.features.length === 0) {
-    print('No export candidates found. Please loosen cloud thresholds or date range.');
+function scanWindow(windowStartDate, windowEndExclusiveDate) {
+  if (windowEndExclusiveDate.getTime() > endDateExclusiveClient.getTime()) {
+    print(
+      'No complete-coverage window found for start date:',
+      formatDateIso(windowStartDate),
+      'before END_DATE:',
+      END_DATE
+    );
+    print('Adaptive TVDI export task count:', exportedWindowCount);
     return;
   }
 
-  print('Creating LST/TVDI export tasks:', candidateTable.features.length);
-  var previewProps = candidateTable.features[0].properties;
-  var previewProducts = buildLSTTVDIProducts(previewProps.date, getSentinel2RawImage(previewProps));
+  var windowStart = formatDateIso(windowStartDate);
+  var windowEndExclusive = formatDateIso(windowEndExclusiveDate);
 
-  Map.addLayer(
-    previewProducts.sentinel2Image,
-    {bands: ['RED', 'GREEN', 'BLUE'], min: 0.02, max: 0.3},
-    'Preview Sentinel-2 RGB first candidate',
-    false
-  );
-  Map.addLayer(
-    previewProducts.lst10mWithResiduals,
-    lstVis,
-    'Preview LST 10 m first candidate',
-    true
-  );
-  Map.addLayer(
-    previewProducts.tvdi,
-    tvdiVis,
-    'Preview TVDI 10 m first candidate',
-    false
-  );
+  getWindowCounts(windowStart, windowEndExclusive).evaluate(function(counts) {
+    var landsatCount = counts ? counts.landsat_count : 0;
+    var sentinel2Count = counts ? counts.sentinel2_count : 0;
+    var nextEndExclusiveDate = addDays(windowEndExclusiveDate, 1);
 
-  candidateTable.features.forEach(function(feature, index) {
-    createExportTasks(feature.properties, index);
+    if (sentinel2Count < MIN_SENTINEL2_IMAGES_FOR_WINDOW ||
+        landsatCount < MIN_LANDSAT_IMAGES_FOR_WINDOW) {
+      print(
+        'Window not enough images:',
+        windowStart,
+        'to',
+        windowEndExclusive,
+        counts
+      );
+      scanWindow(windowStartDate, nextEndExclusiveDate);
+      return;
+    }
+
+    getSentinel2Coverage(windowStart, windowEndExclusive).evaluate(function(coverage) {
+      var ratio = coverage ? Number(coverage.coverage_ratio) : 0;
+      var diagnostics = {
+        window_start: windowStart,
+        window_end_exclusive: windowEndExclusive,
+        window_end_inclusive: formatDateIso(addDays(windowEndExclusiveDate, -1)),
+        landsat_count: landsatCount,
+        sentinel2_count: sentinel2Count,
+        coverage_ratio: ratio
+      };
+
+      if (ratio >= COVERAGE_THRESHOLD) {
+        createTVDIExport(windowStartDate, windowEndExclusiveDate, diagnostics);
+        findNextWindow(windowEndExclusiveDate);
+      } else {
+        print('Window coverage not enough:', diagnostics);
+        scanWindow(windowStartDate, nextEndExclusiveDate);
+      }
+    });
   });
-});
+}
+
+function findNextWindow(windowStartDate) {
+  if (windowStartDate.getTime() >= endDateExclusiveClient.getTime()) {
+    print('Adaptive TVDI export task count:', exportedWindowCount);
+    print('Finished adaptive TVDI window scan.');
+    return;
+  }
+
+  scanWindow(windowStartDate, addDays(windowStartDate, 1));
+}
+
+findNextWindow(startDateClient);
